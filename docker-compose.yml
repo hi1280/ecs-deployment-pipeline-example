@@ -1,0 +1,38 @@
+version: "3"
+services:
+  web:
+    build: ./web
+    ports:
+      - "5000:5000"
+    environment:
+      ENV: development
+      DB_USER_NAME: app
+      DB_USER_PASSWORD: password
+      DB_HOST: db
+      DB_DATABASE: knights
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: mysql:5.7
+    ports:
+      - "32000:3306"
+    environment:
+      MYSQL_DATABASE: knights
+      MYSQL_USER: app
+      MYSQL_PASSWORD: password
+      MYSQL_ROOT_PASSWORD: root
+    healthcheck:
+      test: mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD
+
+  migrate:
+    build: ./migrate
+    environment:
+      DATABASE_USER: app
+      DATABASE_PASSWORD: password
+      DATABASE_HOST: db
+      DATABASE_NAME: knights
+    depends_on:
+      db:
+        condition: service_healthy

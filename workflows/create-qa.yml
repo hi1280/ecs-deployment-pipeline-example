@@ -1,0 +1,192 @@
+name: Creating qa environment
+
+on:
+  pull_request:
+    types: [opened]
+    branches:
+      - main
+
+env:
+  ENV: pr${{ github.event.pull_request.number }}
+  TFSTATE_BUCKET: ${{ secrets.TFSTATE_BUCKET }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  CreateEnv:
+    runs-on: ubuntu-20.04
+    permissions:
+      id-token: write
+      contents: read
+    timeout-minutes: 10
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-role
+        aws-region: ap-northeast-1
+
+    - name: Import source credentials
+      run: aws codebuild import-source-credentials --token ${{ secrets.PERSONAL_ACCESS_TOKEN }} --server-type GITHUB --auth-type PERSONAL_ACCESS_TOKEN
+
+    - name: Run CodeBuild
+      uses: aws-actions/aws-codebuild-run-build@v1
+      with:
+        project-name: ecs-deploy-apply
+        env-vars-for-codebuild: |
+          ENV,
+          TFSTATE_BUCKET
+
+  BuildWeb:
+    runs-on: ubuntu-20.04
+    permissions:
+      id-token: write
+      contents: read
+    timeout-minutes: 10
+    needs: CreateEnv
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-role
+        aws-region: ap-northeast-1
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Build and push container image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+      working-directory: ./web
+      run: |
+        docker build -t $ECR_REGISTRY/ecs-deploy-qa-$ENV-web:$IMAGE_TAG .
+        docker push $ECR_REGISTRY/ecs-deploy-qa-$ENV-web:$IMAGE_TAG
+
+  BuildMigrate:
+    runs-on: ubuntu-20.04
+    permissions:
+      id-token: write
+      contents: read
+    timeout-minutes: 10
+    needs: CreateEnv
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-role
+        aws-region: ap-northeast-1
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Build and push container image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+      working-directory: ./migrate
+      run: |
+        docker build -t $ECR_REGISTRY/ecs-deploy-qa-$ENV-migrate:$IMAGE_TAG .
+        docker push $ECR_REGISTRY/ecs-deploy-qa-$ENV-migrate:$IMAGE_TAG
+
+  DbMigrate:
+    runs-on: ubuntu-20.04
+    permissions:
+      id-token: write
+      contents: read
+    timeout-minutes: 10
+    needs: [BuildWeb, BuildMigrate]
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-role
+        aws-region: ap-northeast-1
+
+    - name: Setup ecspresso
+      uses: kayac/ecspresso@v1
+      with:
+        version: v1.7.1
+
+    - name: Run DB Migration
+      working-directory: ./ecspresso/qa/migrate
+      run: ecspresso run
+
+  DeployApp:
+    runs-on: ubuntu-20.04
+    permissions:
+      id-token: write
+      contents: read
+    timeout-minutes: 10
+    needs: DbMigrate
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-role
+        aws-region: ap-northeast-1
+
+    - name: Setup ecspresso
+      uses: kayac/ecspresso@v1
+      with:
+        version: v1.7.1
+
+    - name: Deploy ECS service
+      working-directory: ./ecspresso/qa/app
+      run: ecspresso deploy --no-wait
+
+  NotifySucceed:
+    if: success()
+    runs-on: ubuntu-20.04
+    timeout-minutes: 3
+    needs: DeployApp
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+
+    - name: Create comments
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+        DOMAIN: ${{ secrets.DOMAIN }}
+      run: |
+        gh pr comment ${{ github.event.pull_request.number }} --body "検証環境を作成しました。
+        https://$ENV.$DOMAIN"
+
+  NotifyFailure:
+    if: failure()
+    runs-on: ubuntu-20.04
+    timeout-minutes: 3
+    needs: DeployApp
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+
+    - name: Create comments
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+      run: |
+        gh pr comment ${{ github.event.pull_request.number }} --body "検証環境の作成に失敗しました。
+        #$GITHUB_RUN_NUMBER"

@@ -1,0 +1,128 @@
+name: Updating production environment
+
+on:
+  workflow_dispatch
+
+env:
+  ENV: production
+  TFSTATE_BUCKET: ${{ secrets.TFSTATE_BUCKET }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  CreateEnv:
+    runs-on: ubuntu-20.04
+    permissions:
+      id-token: write
+      contents: read
+    timeout-minutes: 10
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-role
+        aws-region: ap-northeast-1
+
+    - name: Import source credentials
+      run: aws codebuild import-source-credentials --token ${{ secrets.PERSONAL_ACCESS_TOKEN }} --server-type GITHUB --auth-type PERSONAL_ACCESS_TOKEN
+
+    - name: Run CodeBuild
+      uses: aws-actions/aws-codebuild-run-build@v1
+      with:
+        project-name: ecs-deploy-apply
+        buildspec-override: terraform/common/buildspec/production/apply.yml
+        env-vars-for-codebuild: |
+          TFSTATE_BUCKET
+
+  DbMigrate:
+    runs-on: ubuntu-20.04
+    permissions:
+      id-token: write
+      contents: read
+    timeout-minutes: 10
+    needs: CreateEnv
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-role
+        aws-region: ap-northeast-1
+
+    - name: Setup ecspresso
+      uses: kayac/ecspresso@v1
+      with:
+        version: v1.7.1
+
+    - name: Run DB Migration
+      working-directory: ./ecspresso/production/migrate
+      run: ecspresso run
+
+  DeployApp:
+    runs-on: ubuntu-20.04
+    permissions:
+      id-token: write
+      contents: read
+    timeout-minutes: 10
+    needs: DbMigrate
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-role
+        aws-region: ap-northeast-1
+
+    - name: Setup ecspresso
+      uses: kayac/ecspresso@v1
+      with:
+        version: v1.7.1
+
+    - name: Deploy ECS service
+      working-directory: ./ecspresso/production/app
+      run: ecspresso deploy --no-wait
+
+  NotifySucceed:
+    if: success()
+    runs-on: ubuntu-20.04
+    timeout-minutes: 3
+    needs: DeployApp
+
+    steps:
+    - name: Post to a Slack channel
+      id: slack
+      uses: slackapi/slack-github-action@v1.16.0
+      env:
+        SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      with:
+        channel-id: ${{ secrets.SLACK_CHANNEL }}
+        slack-message: |
+          本番環境を更新しました(${{ env.IMAGE_TAG }})
+          https://production.${{ secrets.DOMAIN }}
+
+  NotifyFailure:
+    if: failure()
+    runs-on: ubuntu-20.04
+    timeout-minutes: 3
+    needs: DeployApp
+
+    steps:
+    - name: Post to a Slack channel
+      id: slack
+      uses: slackapi/slack-github-action@v1.16.0
+      env:
+        SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      with:
+        channel-id: ${{ secrets.SLACK_CHANNEL }}
+        slack-message: |
+          本番環境の更新に失敗しました(${{ env.IMAGE_TAG }})
+          #${{ github.run_number }}

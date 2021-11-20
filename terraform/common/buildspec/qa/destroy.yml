@@ -1,0 +1,11 @@
+version: 0.2
+
+phases:
+  build:
+    commands:
+      - cd terraform/qa
+      - terraform init -backend-config="bucket=$TFSTATE_BUCKET"
+      - terraform workspace select $ENV
+      - terraform destroy -var tfstate_bucket=$TFSTATE_BUCKET -auto-approve
+      - terraform workspace select default
+      - terraform workspace delete $ENV
